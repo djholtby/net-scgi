@@ -51,7 +51,7 @@
          scgi-ws-connection-timeout)
 
 (provide status-code? status->message scgi-handler/c scgi-responder/c scgi-websock-handler/c
-         (prefix-out MIME: (all-from-out "private/mime-types.rkt")))
+         (prefix-out MIME: (all-from-out "scgi/private/mime-types.rkt")))
 
 
  
