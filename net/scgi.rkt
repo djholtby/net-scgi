@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require "private/scgi.rkt" "private/mime-types.rkt" "private/http-status-codes.rkt"
+(require "scgi/private/scgi.rkt" "scgi/private/mime-types.rkt" "scgi/private/http-status-codes.rkt"
          net/cookie racket/contract racket/tcp racket/unix-socket gregor xml json)
 
 (define scgi-responder/c (-> scgi-request? input-port? output-port? any/c))
