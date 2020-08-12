@@ -16,7 +16,7 @@
          (prefix-out scgi- (combine-out request? request-method request-scheme request-host request-uri request-content request-headers))
          (prefix-out scgi- (struct-out response))
          (prefix-out scgi- (struct-out ws-conn))
-         (prefix-out scgi- (combine-out websocket-send! websocket-read! ws-connection-timeout close-websocket))
+         (prefix-out scgi- (combine-out websocket-send! websocket-read! ws-connection-timeout websocket-close!))
          )
 
 
@@ -148,14 +148,19 @@
                 (close-input-port in)
                 #f))))))
 
-(define <CRLF> (list->bytes '(#x0d #x0a)))
+(define <CRLF> #"\r\n")
+
+;; (->response resp) returns resp if it is already  response, otherwise coerces resp into a text/plain response (using ~a format)
+(define (->response resp)
+  (if (response? resp)
+      resp
+      (make-response/text (~a resp))))
 
 (define (make-scgi-responder handler)
   (λ (req in out)
     (let ([resp (handler req)])
-      (when (response? resp)
-        (output-response resp out)
-        (flush-output out)))))
+      (output-response (->response resp) out)
+      (flush-output out))))
 
 (define (scgi-serve/listener handler listener-custodian listener)
   (let ([accept (if (unix-socket-listener? listener) unix-socket-accept tcp-accept)])
@@ -204,7 +209,8 @@
 |#
 (define websocket-accept-uuid #"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
-(struct ws-conn (in out manager server? [connected? #:mutable] [timeout #:mutable]))
+(struct ws-conn (in out manager server? [connected? #:mutable] [timeout #:mutable])
+   #:property prop:evt (struct-field-index in))
 
 (define (make-websock-connection in out server?)
   (let ([conn (ws-conn in out (current-websocket-manager) server? #t (+ (current-seconds) (ws-connection-timeout)))])
@@ -311,7 +317,7 @@
               (current-seconds))
             (- (ws-conn-timeout (vector-ref (min-heap-nodes heap) 0)) (current-seconds))]
           [else (let [(conn (vector-ref (min-heap-nodes heap) 0))]
-                  (close-websocket conn #"timeout")
+                  (websocket-close! conn #"timeout")
                   (vector-set! (min-heap-nodes heap) 0 0)
                   (hash-remove! (min-heap-keys heap) conn)
                   (set-min-heap-count! heap (sub1 (min-heap-count heap)))
@@ -341,7 +347,7 @@
                         (loop)))))))
       (channel-get result-channel))))
 
-(define (close-websocket conn [reason #""])
+(define (websocket-close! conn [reason #""])
   (ws-manager-msg 'close conn)
   (when (ws-conn-connected? conn)
     (set-ws-conn-connected?! conn #f)
@@ -424,15 +430,14 @@
     [(0) (error who "Received continuation frame without initial frame")]))
 
 (define (websocket-read! conn)
-  
   (let loop ([frame-buffer (open-output-bytes)]
              [opcode #f])
     (ws-manager-msg 'bump conn)
     (define frame (read-frame (ws-conn-in conn)))
-    (cond [(eof-object? frame) (close-websocket conn) eof]
+    (cond [(eof-object? frame) (websocket-close! conn) eof]
           [(> (websocket-frame-opcode frame) 7) ; control frame
            (case (websocket-frame-opcode frame)
-             [(8) (close-websocket conn (websocket-frame-payload frame)) eof]
+             [(8) (websocket-close! conn (websocket-frame-payload frame)) eof]
              [(9) (do-pong! conn) (loop frame-buffer opcode)]
              [(10 11 12 13 14 15) (loop frame-buffer opcode)])] ; reserved for future control frames [10 is pong, but there's nothing to do]
           [(websocket-frame-final? frame)
