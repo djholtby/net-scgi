@@ -82,17 +82,13 @@
                      
                        (if (and (entity-disposition ent) (assoc "name" (disposition-params (entity-disposition ent))))
                            (cons (cons 
-                                  (cdr (assoc "name" (disposition-params (entity-disposition ent))))
+                                  (string->symbol (cdr (assoc "name" (disposition-params (entity-disposition ent)))))
                                   ent)
                                  acc)
                            acc)))))]
         ['(application . x-www-form-urlencoded)
          (form-urlencoded->alist (bytes->string/utf-8 body))]
-        ['(application . json)
-         (string->jsexpr (bytes->string/name body encoding))]
-        [else
-         (bytes->string/name body encoding)]
-         ))))
+        [else #f]))))
        
 
 
