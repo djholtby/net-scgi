@@ -1,7 +1,7 @@
 #lang racket/base
 
 (require "scgi/private/scgi.rkt" "scgi/private/mime-types.rkt" "scgi/private/http-status-codes.rkt"
-         net/cookie racket/contract racket/tcp racket/unix-socket gregor xml json)
+         net/cookies/server racket/contract racket/tcp racket/unix-socket gregor xml json)
 
 (define scgi-responder/c (-> scgi-request? input-port? output-port? any/c))
 (define scgi-handler/c (-> scgi-request? any/c))
@@ -38,7 +38,7 @@
  [make-websock-responder (->* (scgi-websock-handler/c)
                               (#:on-connect (or/c #f (-> scgi-request? (values (listof bytes?) any/c))))
                               scgi-responder/c)]
- [scgi-close-websocket (-> scgi-ws-conn? any/c)]
+ [scgi-websocket-close! (-> scgi-ws-conn? any/c)]
  [scgi-websocket-read! (-> scgi-ws-conn? (or/c bytes? string? eof-object?))]
  [scgi-websocket-send! (-> scgi-ws-conn? (or/c bytes? string?) any/c)]
  )
