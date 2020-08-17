@@ -171,22 +171,26 @@ standard HTTP response, respectively.  This is similar to the Racket webserver.
 
 If you are using nginx as your webserver, it leaves the SCGI sockets open, so it is possible to implement websockets.  To do so, use @racket[make-websock-responder] to create an appropriate responder.
 
-@defstruct[scgi-ws-conn ([connected? any/c #:mutable]) #:omit-constructor]{An opaque struct used to handle a websocket connection.  Communicate using @racket[scgi-websocket-send!] and @racket[scgi-websocket-read!].
+@defstruct*[scgi-ws-conn ([connected? any/c]) #:omit-constructor]{An opaque struct used to handle a websocket connection.  Communicate using @racket[scgi-websocket-send!] and @racket[scgi-websocket-read!].
                                                                                                                                                       The connection may be closed using @racket[scgi-websocket-close!].
 
                                                                                                                                                       New instances can only be created by the websocket responder procedure.  @racket[scgi-ws-conn-connected?] is the only selector method exported.
 
-                                                                                                                                                      The struct is synchronizable, and the synchronization is ready when the input socket has unread data (however, this data may be a control frame so
-                                                                                                                                                      it is not a garauntee that @racket[scgi-websocket-read!] will not block.}
+                                                                                                                                                      The struct is synchronizable, and the synchronization is ready when a message has been received (@racket[scgi-websocket-read!] would not block.)
+The synchronization result is the @racket[scgi-ws-conn] itself.  Any control frames received will be handled when the connection is considered for synchronization.}
 
 @defproc[(scgi-websocket-send! [conn scgi-ws-conn?]
                                [message (or/c string? bytes?)])
          void?]{If conn is connected, send message.  String messages are sent as UTF-8 in a text frame.  Bytes messages are sent as-is in a binary frame.  Frames are not fragmented.}
 
 @defproc[(scgi-websocket-read! [conn scgi-ws-conn?]) (or/c string? bytes? eof-object?)]{Blocks until a data frame is received.  Text frames are converted to strings by @racket[bytes->string/utf-8].  Binary frames are kept as byte strings.  If the connection is closed, returns @racket[eof].
-                                                                                                                                                                        Accepts fragmented frames.}
+                                                                                                                                                                        Accepts fragmented frames}
 
-@defproc[(scgi-websocket-close! [conn scgi-ws-conn] [#:reason reason bytes? #""]) void?]{Closes @racket[conn] if it was not already closed.  If present, reason is sent as the body of the disconnect frame.}
+@defproc[(scgi-websocket-read-avail! [conn scgi-ws-conn?]) (or/c string? bytes? eof-object? #f)]{As @racket[scgi-websocket-read!] but if there is no frame to read (or if some frames are read but the final frame is not avalable yet) then it
+returns @racket[#f].  Any pending control frames are handled even if the result is @racket[#f]}
+
+
+@defproc[(scgi-websocket-close! [conn scgi-ws-conn?] [#:reason reason bytes? #""]) void?]{Closes @racket[conn] if it was not already closed.  If present, reason is sent as the body of the disconnect frame.}
                                                                                                                                                                  
                                                                                  
 

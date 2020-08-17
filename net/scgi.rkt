@@ -40,8 +40,13 @@
                               scgi-responder/c)]
  [scgi-websocket-close! (-> scgi-ws-conn? any/c)]
  [scgi-websocket-read! (-> scgi-ws-conn? (or/c bytes? string? eof-object?))]
+ [scgi-websocket-read-avail! (-> scgi-ws-conn? (or/c bytes? string? eof-object? exact-positive-integer?))]
  [scgi-websocket-send! (-> scgi-ws-conn? (or/c bytes? string?) any/c)]
  )
+
+(define (scgi-websocket-read-avail! conn)
+  (let ([v (websocket-read-avail! conn)])
+    (if (exact-positive-integer? v) #f v)))
 
 (provide
          scgi-request-post-data scgi-request-cookies scgi-request-cookie-assf

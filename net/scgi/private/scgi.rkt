@@ -1,7 +1,7 @@
 #lang racket/base
 
 (require net/url net/uri-codec (except-in net/cookies parse-date) racket/tcp racket/list racket/random
-         racket/string racket/promise racket/format gregor xml json net/base64 racket/unix-socket
+         racket/string racket/promise racket/format gregor xml json net/base64 racket/unix-socket racket/port
          "http-status-codes.rkt" (prefix-in MIME: "mime-types.rkt") "mime-parse.rkt")
 
 (provide scgi-serve scgi-serve/unix-socket
@@ -16,6 +16,7 @@
          (prefix-out scgi- (combine-out request? request-method request-scheme request-host request-uri request-content request-headers))
          (prefix-out scgi- (struct-out response))
          (prefix-out scgi- (struct-out ws-conn))
+         websocket-read-avail!
          (prefix-out scgi- (combine-out websocket-send! websocket-read! ws-connection-timeout websocket-close!))
          )
 
@@ -209,11 +210,39 @@
 |#
 (define websocket-accept-uuid #"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
-(struct ws-conn (in out manager server? [connected? #:mutable] [timeout #:mutable])
-   #:property prop:evt (struct-field-index in))
+
+#| ws-conn : what's in the tin
+
+message is a message (string? or bytes?) if there is a pending message, #f if not
+header-bufffer is 14 bytes for reading a frame header,
+fragment buffer is an output-buffer for holding fragments until the final frame is received
+opcode is the opcode of the original frame held in the fragment buffer
+|#
+
+(define (make-ws-conn-guard wsc)
+  (λ ()
+    (if (ws-conn-message wsc)
+        (wrap-evt always-evt (λ (_) wsc))
+        (let ([v (websocket-read-avail! wsc)])
+          (cond [(eof-object? v) eof]
+                [(exact-positive-integer? v)
+                 ;(eprintf "prop:evt - message requires at least ~v bytes of frame...w\n" v)
+                 (replace-evt (peek-bytes-evt v 0 #f (ws-conn-in wsc))
+                              (λ (_) wsc))]
+                              ;(λ (_)
+                               ; ((make-ws-conn-guard wsc))))]
+                [else
+                 ;(eprintf "prop:evt - message ~v ready for read\n" v)
+                 (set-ws-conn-message! wsc v) (wrap-evt always-evt (λ (_) wsc))])))))
+  
+(struct ws-conn (in out manager server? [connected? #:mutable] [timeout #:mutable] [message #:mutable] header-buffer fragment-buffer [opcode #:mutable])
+      #:property prop:evt (λ (wsc)
+                         (guard-evt (make-ws-conn-guard wsc))))
+  
 
 (define (make-websock-connection in out server?)
-  (let ([conn (ws-conn in out (current-websocket-manager) server? #t (+ (current-seconds) (ws-connection-timeout)))])
+  (let ([conn (ws-conn in out (current-websocket-manager) server? #t (+ (current-seconds) (ws-connection-timeout))
+                       #f (make-bytes 14) (open-output-bytes) #f)])
     (ws-manager-msg 'new conn)
     conn))
 
@@ -369,6 +398,69 @@
 
 (struct websocket-frame (final? opcode payload) #:transparent)
 
+;(struct ws-framebuff (in header q fragment-buffer [opcode #:mutable]))
+
+;(define (make-ws-framebuff in)
+;  (ws-framebuff in (make-bytes 14) (make-queue) (open-output-bytes) #f))
+
+(define (bytes->frame header maybe-mask payload)
+  (let ([fin? (not (zero? (bitwise-and header #x80)))]
+        [opcode (bitwise-and header #x0F)])
+    (websocket-frame fin? opcode (mask-payload maybe-mask payload (bytes-length payload)))))
+
+(define (read-frame-avail conn)
+  (let ([in (ws-conn-in conn)]
+        [buffer (ws-conn-header-buffer conn)])
+    (let* ([hres (peek-bytes-avail!*
+                buffer
+                0 #f
+                in 0 2)]
+           [ext-len (cond
+                      [(eof-object? hres) 0]
+                      [(< hres 2) 0]
+                      [(< (bitwise-and (bytes-ref buffer 1) #x7F) 126) 0]
+                      [(= (bitwise-and (bytes-ref buffer 1) #x74) 126) 2]
+                      [else 8])]
+           [xlen-res (cond
+                       [(eof-object? hres) eof]
+                       [(zero? ext-len) 0]
+                       [else
+                        (peek-bytes-avail!*
+                         buffer
+                         2 #f
+                         in 2 (+ 2 ext-len))])]
+           [mask-len (if (and (eqv? xlen-res ext-len)
+                              (not (zero? (bitwise-and (bytes-ref buffer 1) #x80))))
+                         4
+                         0)]
+           [mask-res (cond
+                       [(eof-object? xlen-res) eof]
+                       [(zero? mask-len) 0]
+                       [else
+                        (peek-bytes-avail!*
+                         buffer
+                         (+ 2 ext-len) #f
+                         in (+ 2 ext-len) (+ 2 ext-len mask-len))])]
+           [body-len (cond
+                       [(not (eqv? mask-res mask-len)) 0]
+                       [(zero? ext-len) (bitwise-and (bytes-ref buffer 1) #x7F)]
+                       [else (integer-bytes->integer buffer #f #t 2 (+2 ext-len))])]
+           [body-buff (if (zero? body-len) #f (make-bytes body-len))]
+           [body-res (cond [(eof-object? mask-res) eof]
+                           [(zero? body-len) 0]
+                           [else (peek-bytes-avail!*
+                                  body-buff
+                                  (+ 2 ext-len mask-len) #f
+                                  in 0)])])
+      ;(eprintf "header = ~v xlen-res = ~v mask-res = ~v, body-res = ~v\n body=~v\n\nread = ~v of ~v\n" buffer xlen-res mask-res body-res body-buff (+ hres xlen-res mask-res body-res) (+ 2 ext-len mask-len body-len))
+      (cond [(eof-object? body-res) eof]
+            [(< (+ hres xlen-res mask-res body-res) (+ 2 ext-len mask-len body-len)) (+ 2 ext-len mask-len body-len)]
+            [else
+             (port-commit-peeked (+ 2 ext-len mask-len body-len) (port-progress-evt in) always-evt in)
+             (bytes->frame (bytes-ref buffer 0)
+                           (if (zero? (bitwise-and (bytes-ref buffer 1) #x80)) #f (subbytes buffer (+ 2 ext-len) (+ 2 ext-len mask-len)))
+                           body-buff)]))))
+
 (define (read-frame in)
   (with-handlers ([exn:fail? (λ (e) (if (regexp-match #rx"input port is closed" (exn-message e)) eof (raise e)))])
     (define header (read-byte in))
@@ -429,23 +521,54 @@
     [(3 4 5 6 7) (error who "Unsupported websocket frame opcode: ~v" opcode)]
     [(0) (error who "Received continuation frame without initial frame")]))
 
+(define (dequeue-message! conn)
+  (begin0
+    (ws-conn-message conn)
+    (set-ws-conn-message! conn #f)))
+
 (define (websocket-read! conn)
-  (let loop ([frame-buffer (open-output-bytes)]
-             [opcode #f])
-    (ws-manager-msg 'bump conn)
-    (define frame (read-frame (ws-conn-in conn)))
-    (cond [(eof-object? frame) (websocket-close! conn) eof]
-          [(> (websocket-frame-opcode frame) 7) ; control frame
-           (case (websocket-frame-opcode frame)
-             [(8) (websocket-close! conn (websocket-frame-payload frame)) eof]
-             [(9) (do-pong! conn) (loop frame-buffer opcode)]
-             [(10 11 12 13 14 15) (loop frame-buffer opcode)])] ; reserved for future control frames [10 is pong, but there's nothing to do]
-          [(websocket-frame-final? frame)
-           (write-bytes (websocket-frame-payload frame) frame-buffer)
-           (payload-bytes->payload 'websocket-read! (or opcode (websocket-frame-opcode frame)) (get-output-bytes frame-buffer #t))]
-          [else ; not final frame, not control frame
-           (write-bytes (websocket-frame-payload frame) frame-buffer)
-           (loop frame-buffer (or opcode (websocket-frame-opcode frame)))])))
+  (if (ws-conn-message conn)
+      (dequeue-message! conn)
+      (let loop ([frame-buffer (ws-conn-fragment-buffer conn)]
+                 [opcode (ws-conn-opcode conn)])
+        (ws-manager-msg 'bump conn)
+        (let ([frame (read-frame (ws-conn-in conn))])
+          (cond [(eof-object? frame) (websocket-close! conn) eof]
+                [(> (websocket-frame-opcode frame) 7) ; control frame
+                 (case (websocket-frame-opcode frame)
+                   [(8) (websocket-close! conn (websocket-frame-payload frame)) eof]
+                   [(9) (do-pong! conn) (loop frame-buffer opcode)]
+                   [(10 11 12 13 14 15) (loop frame-buffer opcode)])] ; reserved for future control frames [10 is pong, but there's nothing to do]
+                [(websocket-frame-final? frame)
+                 (write-bytes (websocket-frame-payload frame) frame-buffer)
+                 (set-ws-conn-opcode! conn #f)
+                 (payload-bytes->payload 'websocket-read! (or opcode (websocket-frame-opcode frame)) (get-output-bytes frame-buffer #t))]
+                [else ; not final frame, not control frame
+                 (write-bytes (websocket-frame-payload frame) frame-buffer)
+                 (loop frame-buffer (or opcode (websocket-frame-opcode frame)))])))))
+
+(define (websocket-read-avail! conn)
+  (if (ws-conn-message conn)
+      (dequeue-message! conn)
+      (let loop ([frame-buffer (ws-conn-fragment-buffer conn)]
+                 [opcode (ws-conn-opcode conn)])
+        ;(eprintf "loop: opcode=~a\n" opcode)
+        (ws-manager-msg 'bump conn)
+        (let ([frame (read-frame-avail conn)])
+          (cond [(eof-object? frame) (websocket-close! conn) eof]
+                [(exact-positive-integer? frame) (set-ws-conn-opcode! conn opcode) frame]
+                [(> (websocket-frame-opcode frame) 7) ; control frame
+                 (case (websocket-frame-opcode frame)
+                   [(8) (websocket-close! conn (websocket-frame-payload frame)) eof]
+                   [(9) (do-pong! conn) (loop frame-buffer opcode)]
+                   [(10 11 12 13 14 15) (loop frame-buffer opcode)])] ; reserved for future control frames [10 is pong, but we ignore]
+                [(websocket-frame-final? frame)
+                 (write-bytes (websocket-frame-payload frame) frame-buffer)
+                 (set-ws-conn-opcode! conn #f)
+                 (payload-bytes->payload 'websocket-read-avail! (or opcode (websocket-frame-opcode frame)) (get-output-bytes frame-buffer #t))]
+                [else ; not final frame, not control frame
+                 (write-bytes (websocket-frame-payload frame) frame-buffer)
+                 (loop frame-buffer (or opcode (websocket-frame-opcode frame)))])))))
 
 
 (define (make-websock-responder handler #:on-connect [on-connect #f])
@@ -477,7 +600,7 @@
 
 
 
-#|(module+ main
+(module+ main
 ;  (require racket/pretty)
   (define f1 (websocket-frame #t 1 #"Haldo"))
   (define f1-bytes (open-output-bytes))
@@ -490,13 +613,14 @@
   (scgi-serve
    (make-websock-responder (λ (conn _ignore_)
                              (websocket-send! conn "Hi!\n")
-                             (define msg (websocket-read! conn))
+                             (displayln (sync conn))
+                             (define msg (websocket-read-avail! conn))
                              (displayln msg)
                              (websocket-send! conn msg)
-                             (close-websocket conn #"That's all she wrote"))))
+                             (websocket-close! conn #"That's all she wrote"))))
    #|(make-scgi-responder
     (λ (request)
       (make-response/xexpr '(html () (body () (p () "Testing testing 123!")))
                            #:cookies (list (make-cookie "my-cookie" "testing+testing+123"
                                                         #:secure? #t #:http-only? #t #:max-age 7200)))))))|#
-)|#
+)
